@@ -1,0 +1,4 @@
+.venv
+classes*
+full_dataset.ipynb
+hvcm
