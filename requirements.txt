@@ -1,5 +1,7 @@
 pandas
 torch
+torchvision
+torchaudio
 scikit-learn
 plotly
 nbformat>=4.2.0
