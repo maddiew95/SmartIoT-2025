@@ -8,3 +8,5 @@ nbformat>=4.2.0
 pillow
 matplotlib
 numpy
+nbconvert
+seaborn
