@@ -1,6 +1,7 @@
 pandas
 torch
 torchvision
+torcheval
 torchaudio
 scikit-learn
 plotly

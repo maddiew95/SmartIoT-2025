@@ -5,3 +5,4 @@ hvcm
 *.pth
 .DS_Store
 **output.ipynb
+__pycache__
