@@ -4,5 +4,4 @@ full_dataset.ipynb
 hvcm
 *.pth
 .DS_Store
-**output.ipynb
 __pycache__

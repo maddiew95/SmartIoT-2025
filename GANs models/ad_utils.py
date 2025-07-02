@@ -37,8 +37,8 @@ def process_dataset_multichannel(data, device, sample_rate=1000):
     
     print(f"Processing {num_samples} samples with multi-channel approach...")
     for i in range(num_samples):
-        if i % 100 == 0:
-            print(f"Processed {i}/{num_samples} samples")
+        # if i % 100 == 0:
+        #     print(f"Processed {i}/{num_samples} samples")
         
         # Combine multiple channels into RGB image
         channel_spectrograms = []
@@ -349,7 +349,7 @@ def train_autoencoder(features, device, epochs=20, batch_size=128):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(loader):.6f}")
+        # print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(loader):.6f}")
     return model
 
 # Compute reconstruction errors
