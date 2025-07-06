@@ -439,27 +439,51 @@ def get_percentile_threshold(errors, percentile=95):
     """Get threshold based on percentile (e.g., 90th, 95th)"""
     return np.percentile(errors, percentile)
 
-def train_ocsvm_on_features(features, contamination=0.1):
+# def train_ocsvm_on_features(features, contamination=0.1):
+#     """
+#     Train One-Class SVM on autoencoder features (encoded representations)
+#     features: encoded features from autoencoder encoder
+#     """
+#     from sklearn.svm import OneClassSVM
+#     from sklearn.preprocessing import StandardScaler
+    
+#     # Standardize features
+#     scaler = StandardScaler()
+#     features_scaled = scaler.fit_transform(features)
+    
+#     # Train One-Class SVM
+#     ocsvm = OneClassSVM(kernel='rbf', gamma='scale')
+#     ocsvm.fit(features_scaled)
+    
+#     return ocsvm, scaler
+
+
+def train_binary_svm_on_features(normal_features, faulty_features, contamination=0.1):
     """
-    Train One-Class SVM on autoencoder features (encoded representations)
-    features: encoded features from autoencoder encoder
+    Train Binary Classification SVM on autoencoder features (encoded representations)
+    normal_features: encoded features from normal samples
+    faulty_features: encoded features from faulty samples
     """
-    from sklearn.svm import OneClassSVM
+    from sklearn.svm import SVC
     from sklearn.preprocessing import StandardScaler
+    
+    # Combine features and create labels
+    all_features = np.vstack([normal_features, faulty_features])
+    labels = np.hstack([np.zeros(len(normal_features)), np.ones(len(faulty_features))])  # 0=normal, 1=faulty
     
     # Standardize features
     scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
+    features_scaled = scaler.fit_transform(all_features)
     
-    # Train One-Class SVM
-    ocsvm = OneClassSVM(kernel='rbf', gamma='scale')
-    ocsvm.fit(features_scaled)
+    # Train Binary Classification SVM
+    binary_svm = SVC(kernel='rbf', gamma='scale', probability=True, random_state=42)
+    binary_svm.fit(features_scaled, labels)
     
-    return ocsvm, scaler
+    return binary_svm, scaler
 
-def predict_with_ocsvm(model, ocsvm, scaler, X_data):
+def predict_with_binary_svm(model, binary_svm, scaler, X_data):
     """
-    Get OCSVM predictions using autoencoder encoded features
+    Get Binary SVM predictions using autoencoder encoded features
     """
     model.eval()
     device = next(model.parameters()).device
@@ -481,12 +505,42 @@ def predict_with_ocsvm(model, ocsvm, scaler, X_data):
     
     # Scale and predict
     encoded_scaled = scaler.transform(encoded_features)
-    predictions = ocsvm.predict(encoded_scaled)
+    predictions = binary_svm.predict(encoded_scaled)
     
-    # Convert to anomaly labels (1 = anomaly, 0 = normal)
-    anomaly_preds = (predictions == -1).astype(int)
+    # predictions are already 0/1 (0=normal, 1=anomaly)
+    return predictions.astype(int)
+
+
+# def predict_with_ocsvm(model, ocsvm, scaler, X_data):
+#     """
+#     Get OCSVM predictions using autoencoder encoded features
+#     """
+#     model.eval()
+#     device = next(model.parameters()).device
     
-    return anomaly_preds
+#     # Get encoded features
+#     n_samples, n_channels, n_features = X_data.shape
+#     x = torch.tensor(X_data.reshape(-1, n_features), dtype=torch.float32).to(device)
+    
+#     encoded_features = []
+#     with torch.no_grad():
+#         for i in range(0, len(x), 64):  # Process in batches
+#             batch = x[i:i+64]
+#             encoded = model.encoder(batch)
+#             encoded_features.append(encoded.cpu().numpy())
+    
+#     encoded_features = np.vstack(encoded_features)
+#     # Reshape back and average across channels
+#     encoded_features = encoded_features.reshape(n_samples, n_channels, -1).mean(axis=1)
+    
+#     # Scale and predict
+#     encoded_scaled = scaler.transform(encoded_features)
+#     predictions = ocsvm.predict(encoded_scaled)
+    
+#     # Convert to anomaly labels (1 = anomaly, 0 = normal)
+#     anomaly_preds = (predictions == -1).astype(int)
+    
+#     return anomaly_preds
 
 
 def evaluate_on_test_with_threshold_search(model, threshold, X_test, y_test):
@@ -556,7 +610,7 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     
     # Initialize results storage
-    methods = ['F1_Threshold', 'Accuracy_Threshold', '95th_Percentile', '90th_Percentile', 'OneClass_SVM']
+    methods = ['F1_Threshold', 'Accuracy_Threshold', 'Binary_SVM']
     fold_results = []
     
     # Process each fold
@@ -571,9 +625,12 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
         
         # Separate normal and faulty in training set
         normal_train_mask = train_labels_fold == 0
+        faulty_train_mask = train_labels_fold == 1
         train_normal_fold = train_data_fold[normal_train_mask]
+        train_faulty_fold = train_data_fold[faulty_train_mask]
         
         print(f"Fold {fold+1} - Train normal: {len(train_normal_fold)}")
+        print(f"Fold {fold+1} - Train faulty: {len(train_faulty_fold)}")
         print(f"Fold {fold+1} - Test: {len(test_data_fold)} ({np.sum(test_labels_fold==0)} normal, {np.sum(test_labels_fold==1)} faulty)")
         
         # Optionally augment normal training data with generated samples
@@ -587,10 +644,12 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
         # Process data through feature extraction pipeline
         print("Processing data through feature extraction...")
         augmented_normal_features = process_dataset_multichannel(augmented_normal_data, device)
+        train_faulty_features = process_dataset_multichannel(train_faulty_fold, device)
         test_features = process_dataset_multichannel(test_data_fold, device)
         
         # Add channel dimension for autoencoder compatibility
         augmented_normal_features = augmented_normal_features[:, np.newaxis, :]
+        train_faulty_features = train_faulty_features[:, np.newaxis, :]
         test_features = test_features[:, np.newaxis, :]
         
         # Train autoencoder on augmented normal data
@@ -603,7 +662,7 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
         # Evaluate all methods
         fold_result = {}
         
-        # Method 1: F1-optimized threshold
+        # F1-optimized threshold
         f1_threshold, _ = find_best_threshold(test_errors, test_labels_fold)
         f1_preds = (test_errors > f1_threshold).astype(int)
         fold_result['F1_Threshold'] = {
@@ -614,7 +673,7 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
             'threshold': f1_threshold
         }
         
-        # Method 2: Accuracy-optimized threshold
+        # Accuracy-optimized threshold
         acc_threshold, _ = find_best_threshold_using_accuracy(test_errors, test_labels_fold)
         acc_preds = (test_errors > acc_threshold).astype(int)
         fold_result['Accuracy_Threshold'] = {
@@ -625,45 +684,29 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
             'threshold': acc_threshold
         }
         
-        # Method 3: 95th percentile threshold
-        p95_threshold = get_percentile_threshold(test_errors, 95)
-        p95_preds = (test_errors > p95_threshold).astype(int)
-        fold_result['95th_Percentile'] = {
-            'accuracy': accuracy_score(test_labels_fold, p95_preds),
-            'precision': precision_score(test_labels_fold, p95_preds, zero_division=0),
-            'recall': recall_score(test_labels_fold, p95_preds, zero_division=0),
-            'f1': f1_score(test_labels_fold, p95_preds, zero_division=0),
-            'threshold': p95_threshold
-        }
-        
-        # Method 4: 90th percentile threshold
-        p90_threshold = get_percentile_threshold(test_errors, 90)
-        p90_preds = (test_errors > p90_threshold).astype(int)
-        fold_result['90th_Percentile'] = {
-            'accuracy': accuracy_score(test_labels_fold, p90_preds),
-            'precision': precision_score(test_labels_fold, p90_preds, zero_division=0),
-            'recall': recall_score(test_labels_fold, p90_preds, zero_division=0),
-            'f1': f1_score(test_labels_fold, p90_preds, zero_division=0),
-            'threshold': p90_threshold
-        }
-        
-        # Method 5: One-Class SVM
-        print("Training One-Class SVM...")
-        # Get encoded features for normal data
+        # Binary Classification SVM
+        print("Training Binary Classification SVM...")
+        # Get encoded features for both normal and faulty data
         model.eval()
         with torch.no_grad():
+            # Normal features
             normal_features_tensor = torch.tensor(augmented_normal_features.reshape(-1, 4096), dtype=torch.float32).to(device)
             normal_encoded = model.encoder(normal_features_tensor).cpu().numpy()
             normal_encoded = normal_encoded.reshape(len(augmented_normal_features), -1, normal_encoded.shape[-1]).mean(axis=1)
+            
+            # Faulty features
+            faulty_features_tensor = torch.tensor(train_faulty_features.reshape(-1, 4096), dtype=torch.float32).to(device)
+            faulty_encoded = model.encoder(faulty_features_tensor).cpu().numpy()
+            faulty_encoded = faulty_encoded.reshape(len(train_faulty_features), -1, faulty_encoded.shape[-1]).mean(axis=1)
         
-        ocsvm, scaler = train_ocsvm_on_features(normal_encoded)
-        ocsvm_preds = predict_with_ocsvm(model, ocsvm, scaler, test_features)
-        fold_result['OneClass_SVM'] = {
-            'accuracy': accuracy_score(test_labels_fold, ocsvm_preds),
-            'precision': precision_score(test_labels_fold, ocsvm_preds, zero_division=0),
-            'recall': recall_score(test_labels_fold, ocsvm_preds, zero_division=0),
-            'f1': f1_score(test_labels_fold, ocsvm_preds, zero_division=0),
-            'threshold': 'OCSVM'
+        binary_svm, scaler = train_binary_svm_on_features(normal_encoded, faulty_encoded)
+        binary_svm_preds = predict_with_binary_svm(model, binary_svm, scaler, test_features)
+        fold_result['Binary_SVM'] = {
+            'accuracy': accuracy_score(test_labels_fold, binary_svm_preds),
+            'precision': precision_score(test_labels_fold, binary_svm_preds, zero_division=0),
+            'recall': recall_score(test_labels_fold, binary_svm_preds, zero_division=0),
+            'f1': f1_score(test_labels_fold, binary_svm_preds, zero_division=0),
+            'threshold': 'Binary_SVM'
         }
         
         # Print fold results
@@ -674,6 +717,8 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
             print(f"{method:18} | Acc: {result['accuracy']:.4f} | Prec: {result['precision']:.4f} | Rec: {result['recall']:.4f} | F1: {result['f1']:.4f}")
         
         fold_results.append(fold_result)
+    
+    # ...existing code...
     
     # Aggregate results across folds
     aggregated_results = aggregate_results(fold_results, methods)
