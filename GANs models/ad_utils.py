@@ -13,6 +13,10 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 import torch.optim as optim
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, confusion_matrix
+from sklearn.model_selection import StratifiedKFold
+from scipy import stats
+import pandas as pd
+import matplotlib.pyplot as plt
 
 
 # Alternative: Multi-channel processing
@@ -458,29 +462,6 @@ def get_percentile_threshold(errors, percentile=95):
 #     return ocsvm, scaler
 
 
-def train_binary_svm_on_features(normal_features, faulty_features, contamination=0.1):
-    """
-    Train Binary Classification SVM on autoencoder features (encoded representations)
-    normal_features: encoded features from normal samples
-    faulty_features: encoded features from faulty samples
-    """
-    from sklearn.svm import SVC
-    from sklearn.preprocessing import StandardScaler
-    
-    # Combine features and create labels
-    all_features = np.vstack([normal_features, faulty_features])
-    labels = np.hstack([np.zeros(len(normal_features)), np.ones(len(faulty_features))])  # 0=normal, 1=faulty
-    
-    # Standardize features
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(all_features)
-    
-    # Train Binary Classification SVM
-    binary_svm = SVC(kernel='rbf', gamma='scale', probability=True, random_state=42)
-    binary_svm.fit(features_scaled, labels)
-    
-    return binary_svm, scaler
-
 def predict_with_binary_svm(model, binary_svm, scaler, X_data):
     """
     Get Binary SVM predictions using autoencoder encoded features
@@ -575,7 +556,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, device, generated_data=None, 
-                                                  n_splits=5, epochs=20, batch_size=128):
+                                                  n_splits=5, epochs=20, batch_size=128, gan_type="Unknown"):
     """
     Unified comprehensive cross-validation experiment for anomaly detection
     
@@ -586,11 +567,13 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
         n_splits: Number of cross-validation folds
         epochs: Training epochs for autoencoder
         batch_size: Batch size for training
+        gan_type: Type of GAN used for generated data (for statistical comparison)
 
     Returns:
-        aggregated_results: Averaged metrics across folds
+        aggregated_results: Averaged metrics across folds with std deviations
         fold_results: Individual fold results
         rankings: Method rankings by different criteria
+        gan_comparison_results: Results for GAN vs baseline comparison
     """
     print(f"\n{'='*70}")
     print("COMPREHENSIVE ANOMALY DETECTION CROSS-VALIDATION EXPERIMENT")
@@ -598,7 +581,7 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
     print(f"Normal samples: {len(normal_data)}")
     print(f"Faulty samples: {len(faulty_data)}")
     if generated_data is not None:
-        print(f"Generated samples: {len(generated_data)}")
+        print(f"Generated samples: {len(generated_data)} (GAN Type: {gan_type})")
     print(f"Cross-validation folds: {n_splits}")
     
     # Combine all data for stratified splitting
@@ -610,8 +593,9 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     
     # Initialize results storage
-    methods = ['F1_Threshold', 'Accuracy_Threshold', 'Binary_SVM']
+    methods = ['F1_Threshold', 'Accuracy_Threshold']
     fold_results = []
+    baseline_results = []  # Results without GAN augmentation
     
     # Process each fold
     for fold, (train_idx, test_idx) in enumerate(skf.split(all_data, all_labels)):
@@ -633,7 +617,52 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
         print(f"Fold {fold+1} - Train faulty: {len(train_faulty_fold)}")
         print(f"Fold {fold+1} - Test: {len(test_data_fold)} ({np.sum(test_labels_fold==0)} normal, {np.sum(test_labels_fold==1)} faulty)")
         
-        # Optionally augment normal training data with generated samples
+        # Process data through feature extraction pipeline
+        print("Processing data through feature extraction...")
+        train_faulty_features = process_dataset_multichannel(train_faulty_fold, device)
+        test_features = process_dataset_multichannel(test_data_fold, device)
+        
+        # Add channel dimension for autoencoder compatibility
+        train_faulty_features = train_faulty_features[:, np.newaxis, :]
+        test_features = test_features[:, np.newaxis, :]
+        
+        # ===== BASELINE: Train without GAN augmentation =====
+        baseline_normal_features = process_dataset_multichannel(train_normal_fold, device)
+        baseline_normal_features = baseline_normal_features[:, np.newaxis, :]
+        
+        print("Training baseline autoencoder (without GAN)...")
+        baseline_model = train_autoencoder(baseline_normal_features.reshape(-1, 4096), device, epochs, batch_size)
+        baseline_test_errors = compute_reconstruction_loss(baseline_model, test_features)
+        
+        # Evaluate baseline methods
+        baseline_fold_result = {}
+        
+        # F1-optimized threshold (baseline)
+        baseline_f1_threshold, _ = find_best_threshold(baseline_test_errors, test_labels_fold)
+        baseline_f1_preds = (baseline_test_errors > baseline_f1_threshold).astype(int)
+        baseline_fold_result['F1_Threshold'] = {
+            'accuracy': accuracy_score(test_labels_fold, baseline_f1_preds),
+            'precision': precision_score(test_labels_fold, baseline_f1_preds, zero_division=0),
+            'recall': recall_score(test_labels_fold, baseline_f1_preds, zero_division=0),
+            'f1': f1_score(test_labels_fold, baseline_f1_preds, zero_division=0),
+            'threshold': baseline_f1_threshold
+        }
+        
+        # Accuracy-optimized threshold (baseline)
+        baseline_acc_threshold, _ = find_best_threshold_using_accuracy(baseline_test_errors, test_labels_fold)
+        baseline_acc_preds = (baseline_test_errors > baseline_acc_threshold).astype(int)
+        baseline_fold_result['Accuracy_Threshold'] = {
+            'accuracy': accuracy_score(test_labels_fold, baseline_acc_preds),
+            'precision': precision_score(test_labels_fold, baseline_acc_preds, zero_division=0),
+            'recall': recall_score(test_labels_fold, baseline_acc_preds, zero_division=0),
+            'f1': f1_score(test_labels_fold, baseline_acc_preds, zero_division=0),
+            'threshold': baseline_acc_threshold
+        }
+        
+        
+        baseline_results.append(baseline_fold_result)
+        
+        # ===== GAN-AUGMENTED: Train with GAN augmentation (if available) =====
         if generated_data is not None:
             augmented_normal_data = np.concatenate([generated_data, train_normal_fold], axis=0)
             print(f"Fold {fold+1} - Augmented normal data: {len(augmented_normal_data)} samples")
@@ -641,28 +670,20 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
             augmented_normal_data = train_normal_fold
             print(f"Fold {fold+1} - Using original normal data only")
         
-        # Process data through feature extraction pipeline
-        print("Processing data through feature extraction...")
         augmented_normal_features = process_dataset_multichannel(augmented_normal_data, device)
-        train_faulty_features = process_dataset_multichannel(train_faulty_fold, device)
-        test_features = process_dataset_multichannel(test_data_fold, device)
-        
-        # Add channel dimension for autoencoder compatibility
         augmented_normal_features = augmented_normal_features[:, np.newaxis, :]
-        train_faulty_features = train_faulty_features[:, np.newaxis, :]
-        test_features = test_features[:, np.newaxis, :]
         
         # Train autoencoder on augmented normal data
-        print("Training autoencoder...")
+        print("Training GAN-augmented autoencoder...")
         model = train_autoencoder(augmented_normal_features.reshape(-1, 4096), device, epochs, batch_size)
         
         # Compute reconstruction errors on test set
         test_errors = compute_reconstruction_loss(model, test_features)
         
-        # Evaluate all methods
+        # Evaluate all methods with GAN augmentation
         fold_result = {}
         
-        # F1-optimized threshold
+        # F1-optimized threshold (GAN-augmented)
         f1_threshold, _ = find_best_threshold(test_errors, test_labels_fold)
         f1_preds = (test_errors > f1_threshold).astype(int)
         fold_result['F1_Threshold'] = {
@@ -673,7 +694,7 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
             'threshold': f1_threshold
         }
         
-        # Accuracy-optimized threshold
+        # Accuracy-optimized threshold (GAN-augmented)
         acc_threshold, _ = find_best_threshold_using_accuracy(test_errors, test_labels_fold)
         acc_preds = (test_errors > acc_threshold).astype(int)
         fold_result['Accuracy_Threshold'] = {
@@ -683,61 +704,45 @@ def run_comprehensive_cross_validation_experiment(normal_data, faulty_data, devi
             'f1': f1_score(test_labels_fold, acc_preds, zero_division=0),
             'threshold': acc_threshold
         }
-        
-        # Binary Classification SVM
-        print("Training Binary Classification SVM...")
-        # Get encoded features for both normal and faulty data
-        model.eval()
-        with torch.no_grad():
-            # Normal features
-            normal_features_tensor = torch.tensor(augmented_normal_features.reshape(-1, 4096), dtype=torch.float32).to(device)
-            normal_encoded = model.encoder(normal_features_tensor).cpu().numpy()
-            normal_encoded = normal_encoded.reshape(len(augmented_normal_features), -1, normal_encoded.shape[-1]).mean(axis=1)
-            
-            # Faulty features
-            faulty_features_tensor = torch.tensor(train_faulty_features.reshape(-1, 4096), dtype=torch.float32).to(device)
-            faulty_encoded = model.encoder(faulty_features_tensor).cpu().numpy()
-            faulty_encoded = faulty_encoded.reshape(len(train_faulty_features), -1, faulty_encoded.shape[-1]).mean(axis=1)
-        
-        binary_svm, scaler = train_binary_svm_on_features(normal_encoded, faulty_encoded)
-        binary_svm_preds = predict_with_binary_svm(model, binary_svm, scaler, test_features)
-        fold_result['Binary_SVM'] = {
-            'accuracy': accuracy_score(test_labels_fold, binary_svm_preds),
-            'precision': precision_score(test_labels_fold, binary_svm_preds, zero_division=0),
-            'recall': recall_score(test_labels_fold, binary_svm_preds, zero_division=0),
-            'f1': f1_score(test_labels_fold, binary_svm_preds, zero_division=0),
-            'threshold': 'Binary_SVM'
-        }
-        
-        # Print fold results
-        print(f"\nFold {fold+1} Results:")
-        print("-" * 50)
+
+        # Print fold results comparison
+        print(f"\nFold {fold+1} Results Comparison:")
+        print("-" * 80)
+        print(f"{'Method':<18} | {'Metric':<8} | {'Baseline':<10} | {'GAN-Aug':<10} | {'Improvement':<12}")
+        print("-" * 80)
         for method in methods:
-            result = fold_result[method]
-            print(f"{method:18} | Acc: {result['accuracy']:.4f} | Prec: {result['precision']:.4f} | Rec: {result['recall']:.4f} | F1: {result['f1']:.4f}")
+            for metric in ['accuracy', 'precision', 'recall', 'f1']:
+                baseline_val = baseline_fold_result[method][metric]
+                gan_val = fold_result[method][metric]
+                improvement = gan_val - baseline_val
+                improvement_str = f"{improvement:+.4f}"
+                
+                print(f"{method:<18} | {metric:<8} | {baseline_val:<10.4f} | {gan_val:<10.4f} | {improvement_str:<12}")
         
         fold_results.append(fold_result)
     
-    # ...existing code...
-    
     # Aggregate results across folds
-    aggregated_results = aggregate_results(fold_results, methods)
+    aggregated_results = aggregate_results_with_std(fold_results, methods)
+    baseline_aggregated = aggregate_results_with_std(baseline_results, methods, label="Baseline")
+    
+    # Compare GAN vs Baseline with statistical tests
+    gan_comparison_results = compare_gan_vs_baseline(fold_results, baseline_results, methods, gan_type)
     
     # Rank methods
-    rankings = rank_methods(aggregated_results, methods)
+    rankings = rank_methods_with_std(aggregated_results, methods)
     
-    # Create visualizations
-    visualize_results(aggregated_results, fold_results, methods)
+    # Create enhanced visualizations
+    visualize_results_with_comparison(aggregated_results, baseline_aggregated, fold_results, baseline_results, methods, gan_type)
     
-    # Provide recommendations
-    provide_recommendations(aggregated_results, rankings, methods)
+    # Provide enhanced recommendations
+    provide_enhanced_recommendations(aggregated_results, baseline_aggregated, rankings, methods, gan_comparison_results, gan_type)
     
-    return aggregated_results, fold_results, rankings
+    return aggregated_results, fold_results, rankings, gan_comparison_results
 
-def aggregate_results(fold_results, methods):
-    """Aggregate results across all folds and compute statistics"""
+def aggregate_results_with_std(fold_results, methods, label="GAN-Augmented"):
+    """Aggregate results across all folds and compute statistics with enhanced std reporting"""
     print(f"\n{'='*70}")
-    print("RESULTS AGGREGATION & STATISTICAL ANALYSIS")
+    print(f"RESULTS AGGREGATION & STATISTICAL ANALYSIS ({label})")
     print(f"{'='*70}")
     
     metrics = ['accuracy', 'precision', 'recall', 'f1']
@@ -751,49 +756,522 @@ def aggregate_results(fold_results, methods):
             aggregated_results[method][metric] = {
                 'mean': np.mean(values),
                 'std': np.std(values),
+                'min': np.min(values),
+                'max': np.max(values),
+                'median': np.median(values),
                 'values': values
             }
     
-    # Print detailed results
-    print("\nDETAILED RESULTS SUMMARY:")
-    print("-" * 80)
-    print(f"{'Method':<18} | {'Accuracy':<8} | {'Precision':<9} | {'Recall':<8} | {'F1-Score':<8}")
-    print("-" * 80)
+    # Print detailed results with std deviation
+    print(f"\nDETAILED RESULTS SUMMARY ({label}):")
+    print("-" * 90)
+    print(f"{'Method':<18} | {'Accuracy':<15} | {'Precision':<15} | {'Recall':<15} | {'F1-Score':<15}")
+    print("-" * 90)
     
     for method in methods:
-        acc_mean = aggregated_results[method]['accuracy']['mean']
-        prec_mean = aggregated_results[method]['precision']['mean']
-        rec_mean = aggregated_results[method]['recall']['mean']
-        f1_mean = aggregated_results[method]['f1']['mean']
+        acc_stats = aggregated_results[method]['accuracy']
+        prec_stats = aggregated_results[method]['precision']
+        rec_stats = aggregated_results[method]['recall']
+        f1_stats = aggregated_results[method]['f1']
         
-        print(f"{method:<18} | {acc_mean:<8.4f} | {prec_mean:<9.4f} | {rec_mean:<8.4f} | {f1_mean:<8.4f}")
+        print(f"{method:<18} | {acc_stats['mean']:.4f}±{acc_stats['std']:.4f} | "
+              f"{prec_stats['mean']:.4f}±{prec_stats['std']:.4f} | "
+              f"{rec_stats['mean']:.4f}±{rec_stats['std']:.4f} | "
+              f"{f1_stats['mean']:.4f}±{f1_stats['std']:.4f}")
     
-    # Statistical significance testing
-    print(f"\n{'='*50}")
-    print("STATISTICAL SIGNIFICANCE TESTING")
-    print(f"{'='*50}")
-    
-    # Perform pairwise t-tests for F1 scores
-    f1_data = {method: aggregated_results[method]['f1']['values'] for method in methods}
-    
-    print("\nPairwise t-tests for F1 scores:")
-    print("(p < 0.05 indicates statistically significant difference)")
-    print("-" * 70)
-    
-    method_pairs = [(i, j) for i in range(len(methods)) for j in range(i+1, len(methods))]
-    
-    for i, j in method_pairs:
-        method1, method2 = methods[i], methods[j]
-        values1 = f1_data[method1]
-        values2 = f1_data[method2]
-        
-        # Perform paired t-test
-        statistic, p_value = stats.ttest_rel(values1, values2)
-        significance = "***" if p_value < 0.001 else "**" if p_value < 0.01 else "*" if p_value < 0.05 else "ns"
-        
-        print(f"{method1:18s} vs {method2:18s}: t={statistic:6.3f}, p={p_value:.4f} {significance}")
+    # Additional statistical summary
+    print(f"\nSTATISTICAL SUMMARY ({label}):")
+    print("-" * 80)
+    for method in methods:
+        print(f"\n{method}:")
+        for metric in metrics:
+            stats = aggregated_results[method][metric]
+            print(f"  {metric.capitalize():<10}: {stats['mean']:.4f} ± {stats['std']:.4f} "
+                  f"[{stats['min']:.4f}, {stats['max']:.4f}] (median: {stats['median']:.4f})")
     
     return aggregated_results
+
+def compare_gan_vs_baseline(gan_results, baseline_results, methods, gan_type):
+    """Compare GAN-augmented results vs baseline with statistical significance tests"""
+    print(f"\n{'='*70}")
+    print(f"GAN vs BASELINE STATISTICAL COMPARISON ({gan_type})")
+    print(f"{'='*70}")
+    
+    comparison_results = {}
+    metrics = ['accuracy', 'precision', 'recall', 'f1']
+    
+    print(f"\nPAIRED T-TESTS: {gan_type} vs Baseline")
+    print("(p < 0.05 indicates statistically significant improvement)")
+    print("-" * 90)
+    print(f"{'Method':<18} | {'Metric':<10} | {'Baseline':<12} | {'GAN-Aug':<12} | {'Δ Mean':<10} | {'p-value':<8} | {'Sig':<5}")
+    print("-" * 90)
+    
+    for method in methods:
+        comparison_results[method] = {}
+        
+        for metric in metrics:
+            # Extract values for paired t-test
+            baseline_values = [fold_result[method][metric] for fold_result in baseline_results]
+            gan_values = [fold_result[method][metric] for fold_result in gan_results]
+            
+            # Calculate means and improvement
+            baseline_mean = np.mean(baseline_values)
+            gan_mean = np.mean(gan_values)
+            improvement = gan_mean - baseline_mean
+            
+            # Perform paired t-test
+            statistic, p_value = stats.ttest_rel(gan_values, baseline_values)
+            
+            # Determine significance
+            if p_value < 0.001:
+                significance = "***"
+            elif p_value < 0.01:
+                significance = "**"
+            elif p_value < 0.05:
+                significance = "*"
+            else:
+                significance = "ns"
+            
+            # Store results
+            comparison_results[method][metric] = {
+                'baseline_mean': baseline_mean,
+                'gan_mean': gan_mean,
+                'improvement': improvement,
+                'improvement_pct': (improvement / baseline_mean * 100) if baseline_mean > 0 else 0,
+                'p_value': p_value,
+                'significance': significance,
+                'statistic': statistic
+            }
+            
+            # Print results
+            print(f"{method:<18} | {metric:<10} | {baseline_mean:<12.4f} | {gan_mean:<12.4f} | "
+                  f"{improvement:<+10.4f} | {p_value:<8.4f} | {significance:<5}")
+    
+    # Summary of improvements
+    print(f"\n{'='*50}")
+    print("IMPROVEMENT SUMMARY")
+    print(f"{'='*50}")
+    
+    significant_improvements = 0
+    total_comparisons = len(methods) * len(metrics)
+    
+    for method in methods:
+        method_improvements = []
+        for metric in metrics:
+            result = comparison_results[method][metric]
+            if result['p_value'] < 0.05 and result['improvement'] > 0:
+                significant_improvements += 1
+                method_improvements.append(f"{metric}: +{result['improvement_pct']:.1f}%")
+        
+        if method_improvements:
+            print(f"{method}: {', '.join(method_improvements)}")
+        else:
+            print(f"{method}: No significant improvements")
+    
+    improvement_rate = significant_improvements / total_comparisons * 100
+    print(f"\nOverall: {significant_improvements}/{total_comparisons} comparisons show significant improvement ({improvement_rate:.1f}%)")
+    
+    return comparison_results
+
+def rank_methods_with_std(aggregated_results, methods):
+    """Rank methods based on multiple criteria with consideration for standard deviation"""
+    print(f"\n{'='*50}")
+    print("ENHANCED METHOD RANKING")
+    print(f"{'='*50}")
+    
+    rankings = {}
+    
+    # Rank by F1 score (mean)
+    f1_scores = [(method, aggregated_results[method]['f1']['mean'], aggregated_results[method]['f1']['std']) 
+                 for method in methods]
+    f1_scores.sort(key=lambda x: x[1], reverse=True)
+    rankings['f1'] = f1_scores
+    
+    # Rank by accuracy (mean)
+    accuracies = [(method, aggregated_results[method]['accuracy']['mean'], aggregated_results[method]['accuracy']['std']) 
+                  for method in methods]
+    accuracies.sort(key=lambda x: x[1], reverse=True)
+    rankings['accuracy'] = accuracies
+    
+    # Rank by stability (lowest coefficient of variation)
+    stability_scores = []
+    for method in methods:
+        f1_mean = aggregated_results[method]['f1']['mean']
+        f1_std = aggregated_results[method]['f1']['std']
+        cv = f1_std / f1_mean if f1_mean > 0 else float('inf')
+        stability_scores.append((method, cv, f1_mean))
+    stability_scores.sort(key=lambda x: x[1])
+    rankings['stability'] = stability_scores
+    
+    # Rank by balanced score (average of precision and recall)
+    balanced_scores = []
+    for method in methods:
+        prec = aggregated_results[method]['precision']['mean']
+        rec = aggregated_results[method]['recall']['mean']
+        balanced = (prec + rec) / 2
+        balanced_std = np.sqrt((aggregated_results[method]['precision']['std']**2 + 
+                               aggregated_results[method]['recall']['std']**2) / 2)
+        balanced_scores.append((method, balanced, balanced_std))
+    balanced_scores.sort(key=lambda x: x[1], reverse=True)
+    rankings['balanced'] = balanced_scores
+    
+    # Print rankings with standard deviations
+    print("\nRANKING BY F1 SCORE (Mean ± Std):")
+    for i, (method, score, std) in enumerate(f1_scores, 1):
+        print(f"  {i}. {method:<22s}: {score:.4f} ± {std:.4f}")
+    
+    print("\nRANKING BY ACCURACY (Mean ± Std):")
+    for i, (method, score, std) in enumerate(accuracies, 1):
+        print(f"  {i}. {method:<22s}: {score:.4f} ± {std:.4f}")
+    
+    print("\nRANKING BY STABILITY (Coefficient of Variation):")
+    for i, (method, cv, f1_mean) in enumerate(stability_scores, 1):
+        print(f"  {i}. {method:<22s}: CV = {cv:.4f} (F1 = {f1_mean:.4f})")
+    
+    print("\nRANKING BY BALANCED SCORE (Precision + Recall)/2:")
+    for i, (method, score, std) in enumerate(balanced_scores, 1):
+        print(f"  {i}. {method:<22s}: {score:.4f} ± {std:.4f}")
+    
+    return rankings
+
+def visualize_results_with_comparison(gan_aggregated, baseline_aggregated, gan_fold_results, 
+                                    baseline_fold_results, methods, gan_type):
+    """Create comprehensive visualizations comparing GAN vs baseline results"""
+    metrics = ['accuracy', 'precision', 'recall', 'f1']
+    
+    # Create comprehensive visualization
+    fig, axes = plt.subplots(3, 3, figsize=(24, 18))
+    fig.suptitle(f'Comprehensive Anomaly Detection Results: {gan_type} vs Baseline', 
+                 fontsize=16, fontweight='bold')
+    
+    # Plot 1: Mean performance comparison (GAN vs Baseline)
+    ax1 = axes[0, 0]
+    x = np.arange(len(methods))
+    width = 0.35
+    
+    for i, metric in enumerate(metrics):
+        baseline_means = [baseline_aggregated[method][metric]['mean'] for method in methods]
+        gan_means = [gan_aggregated[method][metric]['mean'] for method in methods]
+        baseline_stds = [baseline_aggregated[method][metric]['std'] for method in methods]
+        gan_stds = [gan_aggregated[method][metric]['std'] for method in methods]
+        
+        offset = (i - 1.5) * width / len(metrics)
+        ax1.errorbar(x + offset - width/4, baseline_means, yerr=baseline_stds, 
+                    fmt='o-', label=f'{metric} (Baseline)', alpha=0.7, capsize=3)
+        ax1.errorbar(x + offset + width/4, gan_means, yerr=gan_stds, 
+                    fmt='s-', label=f'{metric} ({gan_type})', alpha=0.7, capsize=3)
+    
+    ax1.set_xlabel('Methods')
+    ax1.set_ylabel('Score')
+    ax1.set_title('Performance Comparison: GAN vs Baseline')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(methods, rotation=45, ha='right')
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Improvement heatmap
+    ax2 = axes[0, 1]
+    improvement_matrix = np.zeros((len(methods), len(metrics)))
+    
+    for i, method in enumerate(methods):
+        for j, metric in enumerate(metrics):
+            baseline_mean = baseline_aggregated[method][metric]['mean']
+            gan_mean = gan_aggregated[method][metric]['mean']
+            improvement = ((gan_mean - baseline_mean) / baseline_mean * 100) if baseline_mean > 0 else 0
+            improvement_matrix[i, j] = improvement
+    
+    im = ax2.imshow(improvement_matrix, cmap='RdYlGn', aspect='auto', vmin=-10, vmax=10)
+    ax2.set_xticks(range(len(metrics)))
+    ax2.set_yticks(range(len(methods)))
+    ax2.set_xticklabels(metrics)
+    ax2.set_yticklabels(methods)
+    ax2.set_title(f'Improvement Heatmap (%)\n{gan_type} vs Baseline')
+    
+    # Add text annotations
+    for i in range(len(methods)):
+        for j in range(len(metrics)):
+            text = ax2.text(j, i, f'{improvement_matrix[i, j]:.1f}%', 
+                           ha="center", va="center", color="black", fontweight='bold')
+    
+    plt.colorbar(im, ax=ax2)
+    
+    # Plot 3: F1 Score distribution comparison
+    ax3 = axes[0, 2]
+    baseline_f1_data = []
+    gan_f1_data = []
+    
+    for method in methods:
+        baseline_f1_values = [fold_result[method]['f1'] for fold_result in baseline_fold_results]
+        gan_f1_values = [fold_result[method]['f1'] for fold_result in gan_fold_results]
+        baseline_f1_data.append(baseline_f1_values)
+        gan_f1_data.append(gan_f1_values)
+    
+    positions1 = np.arange(1, len(methods) * 2, 2)
+    positions2 = np.arange(2, len(methods) * 2 + 1, 2)
+    
+    bp1 = ax3.boxplot(baseline_f1_data, positions=positions1, widths=0.6, 
+                      patch_artist=True, boxprops=dict(facecolor='lightblue'))
+    bp2 = ax3.boxplot(gan_f1_data, positions=positions2, widths=0.6, 
+                      patch_artist=True, boxprops=dict(facecolor='lightgreen'))
+    
+    ax3.set_ylabel('F1 Score')
+    ax3.set_title('F1 Score Distribution Across Folds')
+    ax3.set_xticks(np.arange(1.5, len(methods) * 2, 2))
+    ax3.set_xticklabels(methods, rotation=45, ha='right')
+    ax3.legend([bp1["boxes"][0], bp2["boxes"][0]], ['Baseline', gan_type])
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Standard deviation comparison
+    ax4 = axes[1, 0]
+    metric_stds_baseline = []
+    metric_stds_gan = []
+    
+    for metric in metrics:
+        baseline_stds = [baseline_aggregated[method][metric]['std'] for method in methods]
+        gan_stds = [gan_aggregated[method][metric]['std'] for method in methods]
+        metric_stds_baseline.append(baseline_stds)
+        metric_stds_gan.append(gan_stds)
+    
+    x = np.arange(len(methods))
+    width = 0.35
+    
+    for i, metric in enumerate(metrics):
+        offset = (i - 1.5) * width / len(metrics)
+        ax4.bar(x + offset - width/4, metric_stds_baseline[i], width/len(metrics), 
+               label=f'{metric} (Baseline)', alpha=0.7)
+        ax4.bar(x + offset + width/4, metric_stds_gan[i], width/len(metrics), 
+               label=f'{metric} ({gan_type})', alpha=0.7)
+    
+    ax4.set_xlabel('Methods')
+    ax4.set_ylabel('Standard Deviation')
+    ax4.set_title('Performance Stability Comparison')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(methods, rotation=45, ha='right')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    # Continue with remaining plots...
+    # Plot 5: Statistical significance visualization
+    ax5 = axes[1, 1]
+    # Create significance matrix
+    sig_matrix = np.zeros((len(methods), len(metrics)))
+    
+    # This would need the comparison results to show p-values
+    # For now, create a placeholder
+    ax5.text(0.5, 0.5, 'Statistical Significance\nMatrix\n(p-values)', 
+            ha='center', va='center', transform=ax5.transAxes, fontsize=12)
+    ax5.set_title('Statistical Significance')
+    
+    # Plot 6: Coefficient of variation
+    ax6 = axes[1, 2]
+    cv_baseline = []
+    cv_gan = []
+    
+    for method in methods:
+        for metric in metrics:
+            baseline_mean = baseline_aggregated[method][metric]['mean']
+            baseline_std = baseline_aggregated[method][metric]['std']
+            gan_mean = gan_aggregated[method][metric]['mean']
+            gan_std = gan_aggregated[method][metric]['std']
+            
+            cv_b = baseline_std / baseline_mean if baseline_mean > 0 else 0
+            cv_g = gan_std / gan_mean if gan_mean > 0 else 0
+            cv_baseline.append(cv_b)
+            cv_gan.append(cv_g)
+    
+    ax6.scatter(cv_baseline, cv_gan, alpha=0.7, s=50)
+    ax6.plot([0, max(cv_baseline + cv_gan)], [0, max(cv_baseline + cv_gan)], 'r--', alpha=0.5)
+    ax6.set_xlabel('Baseline CV')
+    ax6.set_ylabel(f'{gan_type} CV')
+    ax6.set_title('Coefficient of Variation Comparison\n(Lower is more stable)')
+    ax6.grid(True, alpha=0.3)
+    
+    # Plot 7-9: Individual metric comparisons
+    for idx, metric in enumerate(['accuracy', 'precision', 'recall']):
+        ax = axes[2, idx]
+        baseline_values = [baseline_aggregated[method][metric]['mean'] for method in methods]
+        gan_values = [gan_aggregated[method][metric]['mean'] for method in methods]
+        baseline_stds = [baseline_aggregated[method][metric]['std'] for method in methods]
+        gan_stds = [gan_aggregated[method][metric]['std'] for method in methods]
+        
+        x = np.arange(len(methods))
+        width = 0.35
+        
+        ax.bar(x - width/2, baseline_values, width, yerr=baseline_stds, 
+               label='Baseline', alpha=0.7, capsize=5)
+        ax.bar(x + width/2, gan_values, width, yerr=gan_stds, 
+               label=gan_type, alpha=0.7, capsize=5)
+        
+        ax.set_xlabel('Methods')
+        ax.set_ylabel(metric.capitalize())
+        ax.set_title(f'{metric.capitalize()} Comparison')
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods, rotation=45, ha='right')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+def provide_enhanced_recommendations(gan_aggregated, baseline_aggregated, rankings, methods, 
+                                   comparison_results, gan_type):
+    """Provide enhanced recommendations based on GAN vs baseline analysis"""
+    print(f"\n{'='*70}")
+    print(f"ENHANCED ANOMALY DETECTION RECOMMENDATIONS ({gan_type})")
+    print(f"{'='*70}")
+    
+    # Best overall method from GAN results
+    best_f1_method = rankings['f1'][0][0]
+    best_f1_score = rankings['f1'][0][1]
+    best_f1_std = rankings['f1'][0][2]
+    
+    most_stable_method = rankings['stability'][0][0]
+    stability_cv = rankings['stability'][0][1]
+    
+    print(f"\n🏆 BEST METHODS WITH {gan_type}:")
+    print(f"   • Best F1 Score: {best_f1_method} ({best_f1_score:.4f} ± {best_f1_std:.4f})")
+    print(f"   • Most Stable: {most_stable_method} (CV = {stability_cv:.4f})")
+    
+    # GAN effectiveness analysis
+    print(f"\n📈 {gan_type} EFFECTIVENESS:")
+    total_improvements = 0
+    significant_improvements = 0
+    
+    for method in methods:
+        method_improvements = 0
+        method_significant = 0
+        
+        for metric in ['accuracy', 'precision', 'recall', 'f1']:
+            result = comparison_results[method][metric]
+            if result['improvement'] > 0:
+                method_improvements += 1
+            if result['p_value'] < 0.05 and result['improvement'] > 0:
+                method_significant += 1
+                significant_improvements += 1
+            total_improvements += 1
+        
+        improvement_rate = method_improvements / 4 * 100
+        significance_rate = method_significant / 4 * 100
+        
+        print(f"   • {method}: {improvement_rate:.0f}% metrics improved, "
+              f"{significance_rate:.0f}% significantly")
+    
+    overall_significance_rate = significant_improvements / (len(methods) * 4) * 100
+    
+    if overall_significance_rate > 50:
+        gan_effectiveness = "Highly Effective"
+    elif overall_significance_rate > 25:
+        gan_effectiveness = "Moderately Effective"
+    elif overall_significance_rate > 10:
+        gan_effectiveness = "Slightly Effective"
+    else:
+        gan_effectiveness = "Not Effective"
+    
+    print(f"\n🎯 {gan_type} OVERALL EFFECTIVENESS: {gan_effectiveness}")
+    print(f"   • {significant_improvements}/{len(methods) * 4} comparisons show significant improvement")
+    print(f"   • Success Rate: {overall_significance_rate:.1f}%")
+    
+    # Method-specific recommendations
+    print(f"\n📊 METHOD-SPECIFIC INSIGHTS:")
+    for method in methods:
+        gan_f1 = gan_aggregated[method]['f1']['mean']
+        baseline_f1 = baseline_aggregated[method]['f1']['mean']
+        gan_std = gan_aggregated[method]['f1']['std']
+        baseline_std = baseline_aggregated[method]['f1']['std']
+        
+        improvement = gan_f1 - baseline_f1
+        stability_improvement = baseline_std - gan_std
+        
+        characteristics = []
+        if improvement > 0.01:
+            characteristics.append("Performance Boost")
+        if stability_improvement > 0.005:
+            characteristics.append("Stability Gain")
+        if gan_f1 > 0.8:
+            characteristics.append("High Performance")
+        if gan_std < 0.05:
+            characteristics.append("Very Stable")
+        
+        if not characteristics:
+            characteristics.append("No Significant Benefit")
+        
+        print(f"   • {method:<22s}: {', '.join(characteristics)}")
+    
+    # Final recommendations
+    print(f"\n🎯 FINAL RECOMMENDATIONS:")
+    
+    if overall_significance_rate > 25:
+        print(f"   ✅ {gan_type} data augmentation is RECOMMENDED")
+        print(f"   • Use {best_f1_method} for best performance")
+        print(f"   • Expected improvement: Significant in {overall_significance_rate:.0f}% of cases")
+    else:
+        print(f"   ❌ {gan_type} data augmentation shows LIMITED benefit")
+        print(f"   • Consider baseline methods or alternative GAN architectures")
+        print(f"   • Current success rate: {overall_significance_rate:.1f}%")
+    
+    print(f"\n💡 DEPLOYMENT STRATEGY:")
+    if gan_effectiveness in ["Highly Effective", "Moderately Effective"]:
+        print(f"   • Deploy {gan_type}-augmented {best_f1_method} in production")
+        print(f"   • Monitor performance stability (current CV: {rankings['stability'][0][1]:.4f})")
+        print(f"   • Set up A/B testing vs baseline for continuous validation")
+    else:
+        print(f"   • Stick with baseline methods for now")
+        print(f"   • Investigate alternative data augmentation strategies")
+        print(f"   • Consider ensemble methods combining multiple approaches")
+    
+    print(f"\n{'='*70}")
+
+def aggregate_results(fold_results, methods):
+    """Legacy function - redirect to enhanced version"""
+    return aggregate_results_with_std(fold_results, methods, "Legacy")
+
+def rank_methods(aggregated_results, methods):
+    """Legacy function - redirect to enhanced version"""
+    return rank_methods_with_std(aggregated_results, methods)
+
+def visualize_results(aggregated_results, fold_results, methods):
+    """Legacy function - create basic visualization"""
+    print("Using basic visualization - consider using enhanced version for better insights")
+    
+    # Create basic visualization
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # F1 scores
+    f1_means = [aggregated_results[method]['f1']['mean'] for method in methods]
+    f1_stds = [aggregated_results[method]['f1']['std'] for method in methods]
+    
+    axes[0].bar(methods, f1_means, yerr=f1_stds, capsize=5, alpha=0.7)
+    axes[0].set_ylabel('F1 Score')
+    axes[0].set_title('F1 Score Comparison')
+    axes[0].set_xticklabels(methods, rotation=45, ha='right')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Box plots
+    f1_data = []
+    for method in methods:
+        f1_values = [fold_result[method]['f1'] for fold_result in fold_results]
+        f1_data.append(f1_values)
+    
+    axes[1].boxplot(f1_data, labels=methods)
+    axes[1].set_ylabel('F1 Score')
+    axes[1].set_title('F1 Score Distribution')
+    axes[1].set_xticklabels(methods, rotation=45, ha='right')
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+def provide_recommendations(aggregated_results, rankings, methods):
+    """Legacy function - redirect to basic recommendations"""
+    print("Using basic recommendations - consider using enhanced version for better insights")
+    
+    best_f1_method = rankings['f1'][0][0]
+    best_f1_score = rankings['f1'][0][1]
+    
+    print(f"\n🏆 BEST METHOD: {best_f1_method} (F1: {best_f1_score:.4f})")
+    print(f"\n📊 ALL METHODS RANKED BY F1:")
+    for i, (method, score, std) in enumerate(rankings['f1'], 1):
+        print(f"   {i}. {method}: {score:.4f} ± {std:.4f}")
 
 def rank_methods(aggregated_results, methods):
     """Rank methods based on multiple criteria"""
