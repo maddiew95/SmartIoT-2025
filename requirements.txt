@@ -11,3 +11,5 @@ matplotlib
 numpy
 nbconvert
 seaborn
+librosa
+opencv-python
